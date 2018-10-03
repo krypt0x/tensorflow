@@ -17,7 +17,10 @@ cc_library(
         "pywrap_tensor.h",
         "pywrap_tfe.h",
     ],
-    visibility = ["//tensorflow:internal"],
+    visibility = [
+        "//learning/deepmind/courier:__pkg__",
+        "//tensorflow:internal",
+    ],
     deps = [
         "//tensorflow/c:c_api",
         "//tensorflow/c:c_api_internal",
@@ -34,6 +37,7 @@ cc_library(
         "//tensorflow/python:safe_ptr",
         "//third_party/py/numpy:headers",
         "//third_party/python_runtime:headers",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:variant",
     ],
 )
