@@ -75,6 +75,18 @@ ENTRY %constant_pred () -> pred[] {
 
 )"
 },
+// pred array constant
+{
+"ConstantPredArray",
+R"(HloModule module
+
+ENTRY %constant_pred_array () -> pred[2,3] {
+  ROOT %constant = pred[2,3]{1,0} constant(pred[2,3] { { 0, 1, 0 }, { 1, 0, 1 } })
+}
+
+)"
+},
+
 // s32 constant
 {
 "ConstantS32",
@@ -804,6 +816,43 @@ ENTRY %ConstantUnsignedNoOverflow () -> u64[] {
 
 )"
 },
+// CustomCallWithLayoutConstraints
+{
+"CustomCallWithLayoutConstraints",
+R"(HloModule CustomCallWithLayoutConstraints
+
+ENTRY %CustomCallWithLayoutConstraints (p0: f32[42,2,3], p1: f32[123,4]) -> f32[1,2,3] {
+  %p0 = f32[42,2,3]{0,1,2} parameter(0)
+  %p1 = f32[123,4]{0,1} parameter(1)
+  ROOT %custom-call = f32[1,2,3]{0,2,1} custom-call(f32[42,2,3]{0,1,2} %p0, f32[123,4]{0,1} %p1), custom_call_target="baz", operand_layout_constraints={f32[42,2,3]{0,1,2}, f32[123,4]{1,0}}
+}
+
+)"
+},
+// CustomCallWithLayoutConstraintsNoOperands
+{
+"CustomCallWithLayoutConstraintsNoOperands",
+R"(HloModule CustomCallWithLayoutConstraintsNoOperands
+
+ENTRY %CustomCallWithLayoutConstraints () -> f32[1,2,3] {
+  ROOT %custom-call = f32[1,2,3]{0,2,1} custom-call(), custom_call_target="baz", operand_layout_constraints={}
+}
+
+)"
+},
+// CustomCallWithLayoutConstraintsTupleShapes
+{
+"CustomCallWithLayoutConstraintsTupleShapes",
+R"(HloModule CustomCallWithLayoutConstraintsTupleShapes
+
+ENTRY %CustomCallWithLayoutConstraints (p0: (f32[2,2], f32[42,2,3]), p1: f32[123,4]) -> (f32[1,2,3], f32[1,2,3]) {
+  %p0 = (f32[2,2]{0,1}, f32[42,2,3]{0,1,2}) parameter(0)
+  %p1 = f32[123,4]{0,1} parameter(1)
+  ROOT %custom-call = (f32[1,2,3]{0,2,1}, f32[1,2,3]{1,2,0}) custom-call((f32[2,2]{0,1}, f32[42,2,3]{0,1,2}) %p0, f32[123,4]{0,1} %p1), custom_call_target="baz", operand_layout_constraints={(f32[2,2]{1,0}, f32[42,2,3]{2,0,1}), f32[123,4]{1,0}}
+}
+
+)"
+},
   });
   // clang-format on
 }
@@ -968,6 +1017,21 @@ ENTRY Sort {
 
 )"
 },
+// Sort (Key, Value, Value, Value)
+{
+"SortManyValues",
+R"(HloModule sort
+
+ENTRY Sort {
+  keys = f32[1024,16]{0,1} parameter(0)
+  values.0 = s32[1024,16]{0,1} parameter(1)
+  values.1 = u32[1024,16]{0,1} parameter(2)
+  values.2 = f32[1024,16]{0,1} parameter(3)
+  ROOT sorted = (f32[1024,16]{0,1}, s32[1024,16]{0,1}, u32[1024,16]{0,1}, f32[1024,16]{0,1}) sort(keys, values.0, values.1, values.2), dimensions={0}
+}
+
+)"
+},
 // Conditional
 {
 "Conditional",
@@ -1084,6 +1148,25 @@ add {
 ENTRY CrossReplicaSumWithSubgroups {
   input = f32[128,32]{0,1} parameter(0)
   ROOT cross-replica-sum = f32[128,32]{0,1} cross-replica-sum(input), replica_groups={{0,1},{2,3}}, barrier="abc", to_apply=add
+}
+
+)"
+},
+// cross-replica-sum with all-reduce-id
+{
+"CrossReplicaSumAllReduce",
+R"(HloModule CRS
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY CRS {
+  input = f32[8]{0} parameter(0)
+  crs.1 = f32[8]{0} cross-replica-sum(input), replica_groups={{0}}, all_reduce_id=1, to_apply=add
+  ROOT crs.0 = f32[8]{0} cross-replica-sum(input), replica_groups={{0}}, all_reduce_id=1, to_apply=add
 }
 
 )"
@@ -1304,7 +1387,7 @@ TEST_F(HloParserTest, MoreConstants) {
 
 ENTRY %SelectScalarS32True.v4 () -> s32[] {
   %constant.2 = pred[] constant(true)
-  %constant.1 = s32[] constant(-42), sharding={s32[5,6] devices=[2,3]1,2,3,4}
+  %constant.1 = s32[] constant(-42), sharding={s32[5,6] devices=[2,2]1,2,3,4}
   %constant = s32[] constant(42)
   %select = s32[] select(pred[] %constant.2, s32[] %constant.1, s32[] %constant)
 }
@@ -1835,7 +1918,7 @@ TEST(HloParserSingleOpTest, SingleOp) {
   const string text =
       "%multiply = f32[2,4]{1,0} multiply(f32[2,4]{1,0} %broadcast, "
       "f32[2,4]{1,0} %x)";
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_THAT(computation->root_instruction(),
@@ -1844,7 +1927,7 @@ TEST(HloParserSingleOpTest, SingleOp) {
 
 TEST(HloParserSingleOpTest, SingleOpNoShapeProducesError) {
   const string text = "multiply(f32[2,4]{1,0} %broadcast, f32[2,4]{1,0} %x)";
-  StatusOr<std::unique_ptr<HloModule>> module = ParseHloOpToModule(text);
+  StatusOr<std::unique_ptr<HloModule>> module = ParseHloString(text);
   ASSERT_TRUE(!module.status().ok());
   LOG(INFO) << "Status: " << module.status();
   EXPECT_THAT(module.status().ToString(),
@@ -1853,7 +1936,7 @@ TEST(HloParserSingleOpTest, SingleOpNoShapeProducesError) {
 
 TEST(HloParserSingleOpTest, SingleOpNoOperandShapesProducesError) {
   const string text = "%multiply = f32[2,4]{1,0} multiply(%broadcast, %x)";
-  StatusOr<std::unique_ptr<HloModule>> module = ParseHloOpToModule(text);
+  StatusOr<std::unique_ptr<HloModule>> module = ParseHloString(text);
   ASSERT_TRUE(!module.status().ok());
   LOG(INFO) << "Status: " << module.status();
   EXPECT_THAT(module.status().ToString(),
@@ -1863,7 +1946,7 @@ TEST(HloParserSingleOpTest, SingleOpNoOperandShapesProducesError) {
 TEST(HloParserSingleOpTest, SingleOpNoNames) {
   const string text =
       "%multiply = f32[2,4]{1,0} multiply(f32[2,4]{1,0}, f32[2,4]{1,0})";
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_THAT(computation->root_instruction(),
@@ -1872,7 +1955,7 @@ TEST(HloParserSingleOpTest, SingleOpNoNames) {
 
 TEST(HloParserSingleOpTest, CanonicalOp) {
   const string text = "f32[2,4]{1,0} multiply(f32[2,4]{1,0}, f32[2,4]{1,0})";
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_THAT(computation->root_instruction(),
@@ -1908,7 +1991,7 @@ TEST(HloParserSingleOpTest, CanonicalOpWithNested) {
   }
 })";
 
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_EQ(
@@ -1926,7 +2009,7 @@ TEST(HloParserSingleOpTest, SingleOpWithNested) {
   ROOT %subtract = f32[3,2,1,1]{3,2,1,0} subtract(f32[3,2,1,1]{3,2,1,0} %param_0, f32[3,2,1,1]{3,2,1,0} %broadcast)
 })";
 
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_THAT(computation->root_instruction(),
@@ -1939,7 +2022,7 @@ TEST(HloParserSingleOpTest, SingleOpWithNested_DoesNotExist) {
 {
   result = f32[] add(f32[] x, f32[] y)
 })";
-  auto status = ParseHloOpToModule(text).status();
+  auto status = ParseHloString(text).status();
   ASSERT_FALSE(status.ok());
   EXPECT_THAT(status.error_message(),
               ::testing::HasSubstr("does not exist: x"));
@@ -1951,7 +2034,7 @@ TEST(HloParserSingleOpTest, SingleOpWithNested_NoLhs) {
 {
   f32[] add(f32[] x, f32[] y)
 })";
-  auto status = ParseHloOpToModule(text).status();
+  auto status = ParseHloString(text).status();
   ASSERT_FALSE(status.ok());
   EXPECT_THAT(status.error_message(), ::testing::HasSubstr("expects name"));
 }
@@ -1962,7 +2045,7 @@ TEST(HloParserSingleOpTest, SingleOpWithNested_NoOperandName) {
 {
   result = f32[] add(f32[], f32[])
 })";
-  auto status = ParseHloOpToModule(text).status();
+  auto status = ParseHloString(text).status();
   ASSERT_FALSE(status.ok());
   EXPECT_THAT(status.error_message(), ::testing::HasSubstr("expects name"));
 }
@@ -1970,7 +2053,7 @@ TEST(HloParserSingleOpTest, SingleOpWithNested_NoOperandName) {
 TEST(HloParserSingleOpTest, ConvolutionTrivialFeatureGroupCount) {
   const string text =
       R"(%convolution = f32[1,2,1]{2,0,1} convolution(f32[1,2,1]{2,0,1} %copy, f32[1,1,1]{2,1,0} %filter), window={size=1}, dim_labels=b0f_0io->b0f)";
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloOpToModule(text));
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseHloString(text));
   const HloComputation* computation = module->entry_computation();
   ASSERT_NE(computation, nullptr);
   EXPECT_THAT(computation->root_instruction(),
@@ -2068,6 +2151,64 @@ ENTRY %axpy.v5 (alpha: f32[], x: f32[2,4], y: f32[2,4]) -> f32[2,4] {
       ::testing::ElementsAre(op::Parameter(), op::Parameter(), op::Parameter(),
                              op::Broadcast(), op::Multiply(), op::Add()));
 }
+
+TEST_F(HloParserTest, CustomCallWrongNumberofOperandConstraints) {
+  const string original = R"(HloModule CustomCallWrongNumberofOperandConstraints
+
+ENTRY %CustomCallWrongNumberofOperandConstraints (p0: f32[42,2,3], p1: f32[123,4]) -> f32[1,2,3] {
+  %p0 = f32[42,2,3]{0,1,2} parameter(0)
+  %p1 = f32[123,4]{0,1} parameter(1)
+  ROOT %custom-call = f32[1,2,3]{0,1,2} custom-call(f32[42,2,3]{0,1,2} %p0, f32[123,4]{0,1} %p1), custom_call_target="baz", operand_layout_constraints={f32[42,2,3]{0,1,2}}
+}
+
+)";
+  ExpectHasSubstr(ParseHloString(original).status().error_message(),
+                  "Expected 2 operand layout constraints, 1 given");
+}
+
+TEST_F(HloParserTest, CustomCallIncompatibleOperandConstraints) {
+  const string original = R"(HloModule CustomCallIncompatibleOperandConstraints
+
+ENTRY %CustomCallIncompatibleOperandConstraints (p0: f32[42,2,3], p1: f32[123,4]) -> f32[1,2,3] {
+  %p0 = f32[42,2,3]{0,1,2} parameter(0)
+  %p1 = f32[123,4]{0,1} parameter(1)
+  ROOT %custom-call = f32[1,2,3]{0,1,2} custom-call(f32[42,2,3]{0,1,2} %p0, f32[123,4]{0,1} %p1), custom_call_target="baz", operand_layout_constraints={f32[42,2,3]{0,1,2}, f32[555,5]{1,0}}
+}
+
+)";
+  ExpectHasSubstr(ParseHloString(original).status().error_message(),
+                  "operand 1 is not compatible with operand shape");
+}
+
+TEST_F(HloParserTest, AllowShapeWhitespace) {
+  const string text = R"(
+HloModule module
+
+ENTRY entry {
+  ROOT root = f32[ 1, 2,3, 4, 5]{0, 1, 2,3, 4 } parameter(0)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseHloString(text));
+}
+
+TEST_F(HloParserTest, ShapeMismatchInOperand) {
+  const string text = R"(
+HloModule foobar
+
+ENTRY %entrycomp (p: f32[2,2]) -> f32[2,2] {
+  %p = f32[2,2] parameter(0)
+  %constant.1 = f32[2,2] constant(f32[2,2] {{1, 2}, {3, 4}})
+  ROOT %add.1 = f32[2,2] add(f32[2,2] %p, f32[2,5] %constant.1)
+}
+)";
+
+  ExpectHasSubstr(ParseHloString(text).status().error_message(),
+                  "The declared operand shape f32[2,5]{1,0} is not compatible"
+                  " with the shape of the operand instruction f32[2,2]{1,0}.");
+}
+
+// custom call incompatible shape.
 
 }  // namespace
 }  // namespace xla

@@ -136,25 +136,6 @@ Status XlaOpKernelContext::ConstantInputReshaped(
   }
   const XlaExpression* expression = CastExpressionFromTensor(tensor);
 
-  auto copy_tensor_to_literal = [](const Tensor& tensor,
-                                   xla::Literal* literal) {
-    xla::Shape literal_shape;
-    TF_RETURN_IF_ERROR(
-        TensorShapeToXLAShape(tensor.dtype(), tensor.shape(), &literal_shape));
-
-    *literal = xla::Literal(literal_shape);
-
-    // memcpy over the payload ...
-    // TODO(phawkins): handle string types.
-    size_t total_bytes = tensor.TotalBytes();
-    if (total_bytes > 0) {
-      void* dst_ptr = literal->untyped_data();
-      const void* src_ptr = DMAHelper::base(&tensor);
-      memcpy(dst_ptr, src_ptr, total_bytes);
-    }
-    return Status::OK();
-  };
-
   // If the tensor has a known constant value, there is no need to invoke XLA.
   if (expression->has_constant_value()) {
     Tensor temp(tensor.dtype());
@@ -164,14 +145,15 @@ Status XlaOpKernelContext::ConstantInputReshaped(
       return errors::Internal("Incompatible shapes in ConstantInputReshaped.");
     }
 
-    return copy_tensor_to_literal(temp, constant_literal);
+    TF_ASSIGN_OR_RETURN(*constant_literal, HostTensorToLiteral(temp));
+    return Status::OK();
   }
 
   // Make sure we treat zero-element tensors as constant.
   if (new_shape.num_elements() == 0) {
     Tensor temp(tensor.dtype(), new_shape);
-
-    return copy_tensor_to_literal(temp, constant_literal);
+    TF_ASSIGN_OR_RETURN(*constant_literal, HostTensorToLiteral(temp));
+    return Status::OK();
   }
 
   xla::XlaOp handle = expression->handle();
@@ -322,6 +304,15 @@ Status XlaOpKernelContext::ConstantInputReshapedToIntVector(
   return LiteralToInt64Vector(literal, out);
 }
 
+Status XlaOpKernelContext::ConstantInputReshapedToIntVector(
+    absl::string_view name, std::vector<int64>* out) {
+  TF_ASSIGN_OR_RETURN(int index, InputIndex(this, name));
+  xla::Literal literal;
+  TF_RETURN_IF_ERROR(ConstantInputReshaped(
+      index, {InputShape(index).num_elements()}, &literal));
+  return LiteralToInt64Vector(literal, out);
+}
+
 Status XlaOpKernelContext::ConstantInputAsInt64Literal(int index,
                                                        xla::Literal* out) {
   xla::Literal literal;
@@ -413,9 +404,12 @@ Status ReadVariableInputTensor(const Tensor& tensor, DataType type,
 
   XlaContext& xla_context = XlaContext::Get(ctx);
   TF_ASSIGN_OR_RETURN(
-      TensorShape representation_shape,
+      xla::Shape representation_shape,
       xla_context.RepresentationShape(variable->shape(), variable->type()));
-  if (representation_shape == variable->shape()) {
+  xla::Shape xla_shape;
+  TF_RETURN_IF_ERROR(
+      TensorShapeToXLAShape(variable->type(), variable->shape(), &xla_shape));
+  if (xla::ShapeUtil::Compatible(xla_shape, representation_shape)) {
     *value = variable->value();
   } else {
     *value = xla::Reshape(variable->value(), variable->shape().dim_sizes());
@@ -455,23 +449,43 @@ Status XlaOpKernelContext::GetVariableTypeAndShape(int index, DataType* type,
   return Status::OK();
 }
 
-void XlaOpKernelContext::SetOutput(int index, const xla::XlaOp& handle) {
-  // Makes the host Tensor that will refer to the expression.
-  Tensor* output = nullptr;
-  auto shape = builder()->GetShape(handle);
-  if (!shape.ok()) {
-    SetStatus(shape.status());
-    return;
-  }
-
+Status XlaOpKernelContext::allocate_output(int index, const xla::Shape& shape,
+                                           Tensor** output) {
   // The step's default allocator is the dummy XlaCompilationAllocator which
   // simply allocates a metadata buffer to hold the expression to which it
   // corresponds.
-  TensorShape tensor_shape;
+  if (expected_output_dtype(index) == DT_VARIANT) {
+    // tensor_data() is not supported for variant Tensor (i.e.,
+    // DataTypeCanUseMemcpy is false for DT_VARIANT), and so storing the
+    // XlaExpression inside the Tensor's tensor_data() does not work for
+    // variant. Instead construct a uint8 tensor and store the expression in its
+    // value.
+    // TODO(jpienaar): This should be refactored to stop masquerading
+    // XlaExpressions as Tensors.
+    *output = new Tensor();
+    TensorShape tensor_shape;
+    TF_RETURN_IF_ERROR(
+        context_->allocate_temp(DT_UINT8, tensor_shape, *output));
+    context_->set_output(index, **output);
+  } else {
+    TensorShape tensor_shape;
+    TF_RETURN_IF_ERROR(XLAShapeToTensorShape(shape, &tensor_shape));
+    TF_RETURN_IF_ERROR(context_->allocate_output(index, tensor_shape, output));
+  }
+  return Status::OK();
+}
+
+void XlaOpKernelContext::SetOutput(int index, const xla::XlaOp& handle) {
+  // Makes the host Tensor that will refer to the expression.
+  Tensor* output = nullptr;
+  auto shape_or = builder()->GetShape(handle);
+  if (!shape_or.ok()) {
+    SetStatus(shape_or.status());
+    return;
+  }
+
   OP_REQUIRES_OK(context_,
-                 XLAShapeToTensorShape(shape.ValueOrDie(), &tensor_shape));
-  OP_REQUIRES_OK(context_,
-                 context_->allocate_output(index, tensor_shape, &output));
+                 allocate_output(index, shape_or.ValueOrDie(), &output));
 
   // The expression is stored in the tensor's data buffer. Fill in the
   // fields now.
@@ -550,10 +564,13 @@ Status AssignVariableTensor(const Tensor& tensor, DataType type,
   TF_RETURN_IF_ERROR(variable->SetTypeAndShape(type, shape));
 
   XlaContext& xla_context = XlaContext::Get(ctx);
-  TF_ASSIGN_OR_RETURN(TensorShape representation_shape,
+  TF_ASSIGN_OR_RETURN(xla::Shape representation_shape,
                       xla_context.RepresentationShape(shape, type));
-  if (shape != representation_shape) {
-    handle = xla::Reshape(handle, representation_shape.dim_sizes());
+  xla::Shape xla_shape;
+  TF_RETURN_IF_ERROR(TensorShapeToXLAShape(type, shape, &xla_shape));
+  if (!xla::ShapeUtil::Compatible(xla_shape, representation_shape)) {
+    handle = xla::Reshape(handle,
+                          xla::AsInt64Slice(representation_shape.dimensions()));
   }
   return variable->SetValue(handle);
 }
